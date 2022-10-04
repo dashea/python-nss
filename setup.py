@@ -6,6 +6,8 @@ import sys
 import os.path
 import codecs
 
+import pkgconfig
+
 from distutils.core import setup, Extension
 
 def read(rel_path):
@@ -23,35 +25,6 @@ def get_version(rel_path):
 name = 'python-nss'
 version = get_version('src/__init__.py')
 release = version
-
-def find_include_dir(dir_names, include_files, include_roots=None):
-    '''
-    Locate an include directory on the system which contains the specified include files.
-    You must provide a list of directory basenames to search. You may optionally provide
-    a list of include roots. The search proceeds by iterating over each root and appending
-    each directory basename to it. If the resulting directory path contains all the include
-    files that directory is returned. If no directory is found containing all the include
-    files a ValueError is raised.
-    '''
-    if not include_roots:
-        include_roots = ['/usr/include', '/usr/local/include']
-    if len(dir_names) == 0:
-        raise ValueError("directory search list is empty")
-    if len(include_files) == 0:
-        raise ValueError("header file list is empty")
-    for include_root in include_roots:
-        for dir_name in dir_names:
-            include_dir = os.path.join(include_root, dir_name)
-            if os.path.isdir(include_dir):
-                for include_file in include_files:
-                    found = True
-                    file_path = os.path.join(include_dir, include_file)
-                    if not os.path.exists(file_path):
-                        found = False
-                        break
-                if found:
-                    return include_dir
-    raise ValueError("unable to locate include directory containing header files %s" % include_files)
 
 #------------------------------------------------------------------------------
 
@@ -77,44 +50,44 @@ def main(argv):
             include_roots.append(arg.split('--include-root=')[1])
             argv.remove(arg)
 
-    nss_include_dir  = find_include_dir(['nss3', 'nss'],   ['nss.h',  'pk11pub.h'], include_roots=include_roots)
-    nspr_include_dir = find_include_dir(['nspr4', 'nspr'], ['nspr.h', 'prio.h'], include_roots=include_roots)
+    nss_deps = pkgconfig.parse('nss')
+    nspr_deps = pkgconfig.parse('nspr')
 
     nss_error_extension = \
         Extension('nss.error',
                   sources            = ['src/py_nspr_error.c'],
-                  include_dirs       = [nss_include_dir, nspr_include_dir],
+                  include_dirs       = nss_deps['include_dirs'] + nspr_deps['include_dirs'],
                   depends            = ['src/py_nspr_common.h', 'src/py_nspr_error.h',
                                          'src/NSPRerrs.h', 'src/SSLerrs.h', 'src/SECerrs.h'],
-                  libraries          = ['nspr4'],
+                  libraries          = nspr_deps['libraries'],
                   extra_compile_args = extra_compile_args,
                   )
 
     nss_io_extension = \
         Extension('nss.io',
                   sources            = ['src/py_nspr_io.c'],
-                  include_dirs       = [nss_include_dir, nspr_include_dir],
+                  include_dirs       = nss_deps['include_dirs'] + nspr_deps['include_dirs'],
                   depends            = ['src/py_nspr_common.h', 'src/py_nspr_error.h', 'src/py_nspr_io.h'],
-                  libraries          = ['nspr4'],
+                  libraries          = nspr_deps['libraries'],
                   extra_compile_args = extra_compile_args,
                   )
 
     nss_nss_extension = \
         Extension('nss.nss',
                   sources            = ['src/py_nss.c'],
-                  include_dirs       = ['src', nss_include_dir, nspr_include_dir],
+                  include_dirs       = nss_deps['include_dirs'] + nspr_deps['include_dirs'],
                   depends            = ['src/py_nspr_common.h', 'src/py_nspr_error.h', 'src/py_nss.h'],
-                  libraries          = ['nspr4', 'ssl3', 'nss3', 'smime3'],
+                  libraries          = nspr_deps['libraries'] + nss_deps['libraries'],
                   extra_compile_args = extra_compile_args,
                   )
 
     nss_ssl_extension = \
         Extension('nss.ssl',
                   sources            = ['src/py_ssl.c'],
-                  include_dirs       = ['src', nss_include_dir, nspr_include_dir],
+                  include_dirs       = nss_deps['include_dirs'] + nspr_deps['include_dirs'],
                   depends            = ['src/py_nspr_common.h', 'src/py_nspr_error.h', 'src/py_nspr_io.h',
                                         'src/py_ssl.h', 'src/py_nss.h'],
-                  libraries          = ['nspr4', 'ssl3'],
+                  libraries          = nspr_deps['libraries'],
                   extra_compile_args = extra_compile_args,
                   )
 
