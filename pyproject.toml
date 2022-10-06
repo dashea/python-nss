@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools", "pkgconfig"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python-nss"
+version = "1.0.1"
+description = "Python bindings for Network Security Services (NSS) and Netscape Portable Runtime (NSPR)"
+readme = "README"
+
+[[project.authors]]
+name = "John Dennis"
+email = "jdennis@redhat.com"
+
+[project.urls]
+homepage = "http://www.mozilla.org/projects/security/pki/python-nss"
+
+[project.optional-dependencies]
+test = ["six"]
