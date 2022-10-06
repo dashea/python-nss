@@ -4,9 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "python-nss"
-version = "1.0.1"
 description = "Python bindings for Network Security Services (NSS) and Netscape Portable Runtime (NSPR)"
 readme = "README"
+
+# version is defined in src/__init__.py and read in via setup.cfg
+# license is a SPDX string in setup.cfg which follows PEP-639 (the future?) instead of PEP-621 (the now)
+dynamic = ["version", "license"]
 
 [[project.authors]]
 name = "John Dennis"
