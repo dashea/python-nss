@@ -1,4 +1,4 @@
 include doc/ChangeLog
 include doc/examples/*.py
-include test/run_tests test/setup_certs.py test/util.py
+include test/setup_certs.py test/util.py
 include src/*.h

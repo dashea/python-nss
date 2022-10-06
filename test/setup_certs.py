@@ -1,189 +1,85 @@
-from __future__ import absolute_import
-
-import argparse
-import atexit
+from collections.abc import Generator
+from contextlib import contextmanager
 import logging
 import os
+import pathlib
 import re
-import shutil
 import subprocess
-import sys
-from string import Template
-import tempfile
-import six
+from tempfile import NamedTemporaryFile
+import typing
 
-#-------------------------------------------------------------------------------
-logger = None
+import pytest
+
+from util import resolve_path
+
+logger = logging.getLogger()
 
 FIPS_SWITCH_FAILED_ERR = 11
 FIPS_ALREADY_ON_ERR = 12
 FIPS_ALREADY_OFF_ERR = 13
 
-
-class CmdError(Exception):
-    def __init__(self, cmd_args, returncode, message=None, stdout=None, stderr=None):
-        self.cmd_args = cmd_args
-        self.returncode = returncode
-        if message is None:
-            self.message = 'Failed error=%s, ' % (returncode)
-            if stderr:
-                self.message += '"%s", ' % stderr
-            self.message += 'args=%s' % (cmd_args)
-        else:
-            self.message = message
-        self.stdout = stdout
-        self.stderr = stderr
-
-    def __str__(self):
-        return self.message
+_StrOrPath: typing.TypeAlias = str | os.PathLike[str]
 
 
-def run_cmd(cmd_args, input=None):
-    logging.debug(' '.join(cmd_args))
-    try:
-        p = subprocess.Popen(cmd_args,
-                             stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE,
-                             universal_newlines=True)
-        stdout, stderr = p.communicate(input)
-        returncode = p.returncode
-        if returncode != 0:
-            raise CmdError(cmd_args, returncode,
-                           'failed %s' % (' '.join(cmd_args)),
-                           stdout, stderr)
-        return stdout, stderr
-    except OSError as e:
-        raise CmdError(cmd_args, e.errno, stderr=str(e))
-
-def exit_handler(options):
-    logging.debug('in exit handler')
-
-    if options.passwd_filename is not None:
-        logging.debug('removing passwd_filename=%s', options.passwd_filename)
-        os.remove(options.passwd_filename)
-
-    if options.noise_filename is not None:
-        logging.debug('removing noise_filename=%s', options.noise_filename)
-        os.remove(options.noise_filename)
-
-def write_serial(options, serial_number):
-    with open(options.serial_file, 'w') as f:
-        f.write('%x\n' % serial_number)
+@contextmanager
+def _passwd_file(db_passwd: str) -> Generator[str, None, None]:
+    with NamedTemporaryFile() as f:
+        f.write(db_passwd.encode("utf-8"))
+        yield f.name
 
 
-def read_serial(options):
-    if not os.path.exists(options.serial_file):
-        write_serial(options, options.serial_number)
-
-    with open(options.serial_file) as f:
-        serial_number = int(f.readline(), 16)
-    return serial_number
-
-
-def init_noise_file(options):
-    '''Generate a noise file to be used when creating a key
-
-    We create a temporary file on first use and continue to use
-    the same temporary file for the duration of this process.
-    Each time this function is called it writes new random data
-    into the file.
-    '''
+@contextmanager
+def _noise_file() -> Generator[str, None, None]:
     random_data = os.urandom(40)
 
-    if options.noise_filename is None:
-        fd, options.noise_filename = tempfile.mkstemp()
-        os.write(fd, random_data)
-        os.close(fd)
-    else:
-        with open(options.noise_filename, 'wb') as f:
-            f.write(random_data)
-    return
-
-def create_passwd_file(options):
-    fd, options.passwd_filename = tempfile.mkstemp()
-    os.write(fd, options.db_passwd.encode('utf-8'))
-    os.close(fd)
+    with NamedTemporaryFile() as f:
+        f.write(random_data)
+        yield f.name
 
 
-def db_has_cert(options, nickname):
-    cmd_args = ['/usr/bin/certutil',
-                '-d', options.db_name,
-                '-L',
-                '-n', nickname]
+def _create_database(db_passwd: str, db_name: str):
+    with _passwd_file(db_passwd) as pw:
+        cmd_args = [resolve_path("certutil"), "-N", "-d", db_name, "-f", pw]
+        subprocess.check_call(cmd_args)
 
+
+def _increment_serial(serial_file: _StrOrPath) -> int:
+    fd = os.open(serial_file, os.O_RDWR | os.O_CREAT, mode=0o644)
     try:
-        run_cmd(cmd_args)
-    except CmdError as e:
-        if e.returncode == 255 and 'not found' in e.stderr:
-            return False
-        else:
-            raise
-    return True
+        os.lockf(fd, os.F_LOCK, 0)
+        try:
+            with os.fdopen(fd, "r+", closefd=False) as sf:
+                serial_data = sf.readline()
+                if serial_data == "":
+                    serial_number = 1
+                else:
+                    serial_number = int(serial_data, 16)
+                sf.seek(0)
+                sf.write("%x\n" % (serial_number + 1,))
 
-def format_cert(options, nickname):
-    cmd_args = ['/usr/bin/certutil',
-                '-L',                          # OPERATION: list
-                '-d', options.db_name,         # NSS database
-                '-f', options.passwd_filename, # database password in file
-                '-n', nickname,                # nickname of cert to list
-                ]
+            return serial_number
+        finally:
+            os.lockf(fd, os.F_ULOCK, 0)
+    finally:
+        os.close(fd)
 
-    stdout, stderr = run_cmd(cmd_args)
-    return stdout
 
-#-------------------------------------------------------------------------------
+def _create_ca_cert(
+    db_name: str,
+    passwd_file: _StrOrPath,
+    serial_file: _StrOrPath,
+    ca_subject: str,
+    ca_nickname: str,
+    key_size: int,
+    valid_months: int,
+    ca_path_len: int,
+) -> str:
+    serial_number = _increment_serial(serial_file)
 
-def create_database(options):
-    if os.path.exists(options.db_dir) and not os.path.isdir(options.db_dir):
-        raise ValueError('db_dir "%s" exists but is not a directory' % options.db_dir)
-
-    # Create resources
-    create_passwd_file(options)
-
-    if options.clean:
-        logging.info('Creating clean database directory: "%s"', options.db_dir)
-
-        if os.path.exists(options.db_dir):
-            shutil.rmtree(options.db_dir)
-        os.makedirs(options.db_dir)
-
-        cmd_args = ['/usr/bin/certutil',
-                    '-N',                          # OPERATION: create database
-                    '-d', options.db_name,         # NSS database
-                    '-f', options.passwd_filename, # database password in file
-                    ]
-
-        stdout, stderr = run_cmd(cmd_args)
-    else:
-        logging.info('Using existing database directory: "%s"', options.db_dir)
-
-def create_ca_cert(options):
-    serial_number = read_serial(options)
-    init_noise_file(options)
-
-    logging.info('creating ca cert: subject="%s", nickname="%s"',
-                 options.ca_subject, options.ca_nickname)
-
-    cmd_args = ['/usr/bin/certutil',
-                '-S',                            # OPERATION: create signed cert
-                '-x',                            # self-sign the cert
-                '-d', options.db_name,           # NSS database
-                '-f', options.passwd_filename,   # database password in file
-                '-n', options.ca_nickname,       # nickname of cert being created
-                '-s', options.ca_subject,        # subject of cert being created
-                '-g', str(options.key_size),     # keysize
-                '-t', 'CT,,CT',                  # trust
-                '-1',                            # add key usage extension
-                '-2',                            # add basic contraints extension
-                '-5',                            # add certificate type extension
-                '-m', str(serial_number),        # cert serial number
-                '-v', str(options.valid_months), # validity in months
-                '-z', options.noise_filename,    # noise file random seed
-                ]
+    logging.info('creating ca cert: subject="%s", nickname="%s"', ca_subject, ca_nickname)
 
     # Provide input for extension creation prompting
-    input = ''
+    input_data = ""
 
     # >> Key Usage extension <<
     # 0 - Digital Signature
@@ -194,17 +90,17 @@ def create_ca_cert(options):
     # 5 - Cert signing key
     # 6 - CRL signing key
     # Other to finish
-    input += '0\n1\n5\n100\n'
+    input_data += "0\n1\n5\n100\n"
     # Is this a critical extension [y/N]?
-    input += 'y\n'
+    input_data += "y\n"
 
     # >> Basic Constraints extension <<
     # Is this a CA certificate [y/N]?
-    input += 'y\n'
+    input_data += "y\n"
     # Enter the path length constraint, enter to skip [<0 for unlimited path]: > 2
-    input += '%d\n' % options.ca_path_len
+    input_data += "%d\n" % ca_path_len
     # Is this a critical extension [y/N]?
-    input += 'y\n'
+    input_data += "y\n"
 
     # >> NS Cert Type extension <<
     # 0 - SSL Client
@@ -216,39 +112,59 @@ def create_ca_cert(options):
     # 6 - S/MIME CA
     # 7 - Object Signing CA
     # Other to finish
-    input += '5\n6\n7\n100\n'
+    input_data += "5\n6\n7\n100\n"
     # Is this a critical extension [y/N]?
-    input += 'n\n'
+    input_data += "n\n"
 
-    stdout, stderr = run_cmd(cmd_args, input)
-    write_serial(options, serial_number + 1)
+    with _noise_file() as nf:
+        cmd_args = [
+            resolve_path("certutil"),
+            "-S",  # OPERATION: create signed cert
+            "-x",  # self-sign the cert
+            "-d",
+            db_name,  # NSS database
+            "-f",
+            passwd_file,  # database password in file
+            "-n",
+            ca_nickname,  # nickname of cert being created
+            "-s",
+            ca_subject,  # subject of cert being created
+            "-g",
+            str(key_size),  # keysize
+            "-t",
+            "CT,,CT",  # trust
+            "-1",  # add key usage extension
+            "-2",  # add basic contraints extension
+            "-5",  # add certificate type extension
+            "-m",
+            str(serial_number),  # cert serial number
+            "-v",
+            str(valid_months),  # validity in months
+            "-z",
+            nf,  # noise file random seed
+        ]
 
-    return options.ca_nickname
+        subprocess.run(cmd_args, input=input_data.encode("utf-8"), check=True)
 
-def create_server_cert(options):
-    serial_number = read_serial(options)
-    init_noise_file(options)
+    return ca_nickname
 
-    logging.info('creating server cert: subject="%s", nickname="%s"',
-                 options.server_subject, options.server_nickname)
 
-    cmd_args = ['/usr/bin/certutil',
-                '-S',                            # OPERATION: create signed cert
-                '-d', options.db_name,           # NSS database
-                '-f', options.passwd_filename,   # database password in file
-                '-c', options.ca_nickname,       # nickname of CA used to sign this cert
-                '-n', options.server_nickname,   # nickname of cert being created
-                '-s', options.server_subject,    # subject of cert being created
-                '-g', str(options.key_size),     # keysize
-                '-t', 'u,u,u',                   # trust
-                '-5',                            # add certificate type extensionn
-                '-m', str(serial_number),        # cert serial number
-                '-v', str(options.valid_months), # validity in months
-                '-z', options.noise_filename,    # noise file random seed
-                ]
+def _create_server_cert(
+    db_name: str,
+    passwd_file: _StrOrPath,
+    serial_file: _StrOrPath,
+    ca_nickname: str,
+    server_subject: str,
+    server_nickname: str,
+    key_size: int,
+    valid_months: int,
+) -> str:
+    serial_number = _increment_serial(serial_file)
+
+    logging.info('creating server cert: subject="%s", nickname="%s"', server_subject, server_nickname)
 
     # Provide input for extension creation prompting
-    input = ''
+    input_data = ""
 
     # >> NS Cert Type extension <<
     # 0 - SSL Client
@@ -260,39 +176,58 @@ def create_server_cert(options):
     # 6 - S/MIME CA
     # 7 - Object Signing CA
     # Other to finish
-    input += '1\n100\n'
+    input_data += "1\n100\n"
     # Is this a critical extension [y/N]?
-    input += 'n\n'
+    input_data += "n\n"
 
-    stdout, stderr = run_cmd(cmd_args, input)
-    write_serial(options, serial_number + 1)
+    with _noise_file() as nf:
+        cmd_args = [
+            resolve_path("certutil"),
+            "-S",  # OPERATION: create signed cert
+            "-d",
+            db_name,  # NSS database
+            "-f",
+            passwd_file,  # database password in file
+            "-c",
+            ca_nickname,  # nickname of CA used to sign this cert
+            "-n",
+            server_nickname,  # nickname of cert being created
+            "-s",
+            server_subject,  # subject of cert being created
+            "-g",
+            str(key_size),  # keysize
+            "-t",
+            "u,u,u",  # trust
+            "-5",  # add certificate type extensionn
+            "-m",
+            str(serial_number),  # cert serial number
+            "-v",
+            str(valid_months),  # validity in months
+            "-z",
+            nf,  # noise file random seed
+        ]
 
-    return options.server_nickname
+        subprocess.run(cmd_args, input=input_data.encode("utf-8"), check=True)
 
-def create_client_cert(options):
-    serial_number = read_serial(options)
-    init_noise_file(options)
+    return server_nickname
 
-    logging.info('creating client cert: subject="%s", nickname="%s"',
-                 options.client_subject, options.client_nickname)
 
-    cmd_args = ['/usr/bin/certutil',
-                '-S',                            # OPERATION: create signed cert
-                '-d', options.db_name,           # NSS database
-                '-f', options.passwd_filename,   # database password in file
-                '-c', options.ca_nickname,       # nickname of CA used to sign this cert
-                '-n', options.client_nickname,   # nickname of cert being created
-                '-s', options.client_subject,    # subject of cert being created
-                '-g', str(options.key_size),     # keysize
-                '-t', 'u,u,u',                   # trust
-                '-5',                            # add certificate type extensionn
-                '-m', str(serial_number),        # cert serial number
-                '-v', str(options.valid_months), # validity in months
-                '-z', options.noise_filename,    # noise file random seed
-                ]
+def _create_client_cert(
+    db_name: str,
+    passwd_file: _StrOrPath,
+    serial_file: _StrOrPath,
+    ca_nickname: str,
+    client_subject: str,
+    client_nickname: str,
+    key_size: int,
+    valid_months: int,
+) -> str:
+    serial_number = _increment_serial(serial_file)
+
+    logging.info('creating client cert: subject="%s", nickname="%s"', client_subject, client_nickname)
 
     # Provide input for extension creation prompting
-    input = ''
+    input_data = ""
 
     # >> NS Cert Type extension <<
     # 0 - SSL Client
@@ -304,46 +239,78 @@ def create_client_cert(options):
     # 6 - S/MIME CA
     # 7 - Object Signing CA
     # Other to finish
-    input += '0\n100\n'
+    input_data += "0\n100\n"
     # Is this a critical extension [y/N]?
-    input += 'n\n'
+    input_data += "n\n"
 
-    stdout, stderr = run_cmd(cmd_args, input)
-    write_serial(options, serial_number + 1)
+    with _noise_file() as nf:
+        cmd_args = [
+            resolve_path("certutil"),
+            "-S",  # OPERATION: create signed cert
+            "-d",
+            db_name,  # NSS database
+            "-f",
+            passwd_file,  # database password in file
+            "-c",
+            ca_nickname,  # nickname of CA used to sign this cert
+            "-n",
+            client_nickname,  # nickname of cert being created
+            "-s",
+            client_subject,  # subject of cert being created
+            "-g",
+            str(key_size),  # keysize
+            "-t",
+            "u,u,u",  # trust
+            "-5",  # add certificate type extensionn
+            "-m",
+            str(serial_number),  # cert serial number
+            "-v",
+            str(valid_months),  # validity in months
+            "-z",
+            nf,  # noise file random seed
+        ]
+        print("RUNNING %s" % str(cmd_args))
+        result = subprocess.run(cmd_args, input=input_data.encode("utf-8"), check=True)
+        print("RESULT %s" % result)
 
-    return options.client_nickname
+    return client_nickname
 
-def add_trusted_certs(options):
-    name = 'ca_certs'
-    module = 'libnssckbi.so'
-    logging.info('adding system trusted certs: name="%s" module="%s"',
-                 name, module)
 
-    cmd_args = ['/usr/bin/modutil',
-                '-dbdir', options.db_name, # NSS database
-                '-add', name,              # module name
-                '-libfile', module,        # module
-                ]
+def _add_trusted_certs(db_name: str):
+    name = "ca_certs"
+    module = "libnssckbi.so"
+    logging.info('adding system trusted certs: name="%s" module="%s"', name, module)
 
-    run_cmd(cmd_args)
-    return name
+    cmd_args = [
+        resolve_path("modutil"),
+        "-dbdir",
+        db_name,  # NSS database
+        "-add",
+        name,  # module name
+        "-libfile",
+        module,  # module
+    ]
 
-def parse_fips_enabled(string):
-    if re.search('FIPS mode disabled', string):
+    subprocess.check_call(cmd_args)
+
+
+def _parse_fips_enabled(string: str):
+    if re.search("FIPS mode disabled", string):
         return False
-    if re.search('FIPS mode enabled', string):
+    if re.search("FIPS mode enabled", string):
         return True
     raise ValueError('unknown fips enabled string: "%s"' % string)
 
-def get_system_fips_enabled():
-    fips_path = '/proc/sys/crypto/fips_enabled'
+
+def _get_system_fips_enabled():
+    fips_path = "/proc/sys/crypto/fips_enabled"
 
     try:
-        with open(fips_path) as f:
+        with open(fips_path, "rb") as f:
             data = f.read()
-    except Exception as e:
-        logger.warning("Unable to determine system FIPS mode: %s" % e)
-        data = '0'
+    except OSError as e:
+        logger.warning("Unable to determine system FIPS mode: %s", e)
+        data = b"0"
 
     value = int(data)
     if value:
@@ -352,237 +319,154 @@ def get_system_fips_enabled():
         return False
 
 
-def get_db_fips_enabled(db_name):
-    cmd_args = ['/usr/bin/modutil',
-                '-dbdir', db_name,               # NSS database
-                '-chkfips', 'true',              # enable/disable fips
-                ]
+def _get_db_fips_enabled(db_name: str):
+    cmd_args = [
+        resolve_path("modutil"),
+        "-dbdir",
+        db_name,  # NSS database
+        "-chkfips",
+        "true",  # enable/disable fips
+    ]
 
     try:
-        stdout, stderr = run_cmd(cmd_args)
-        return parse_fips_enabled(stdout)
-    except CmdError as e:
+        return _parse_fips_enabled(subprocess.check_output(cmd_args).decode("utf-8"))
+    except subprocess.CalledProcessError as e:
         if e.returncode == FIPS_SWITCH_FAILED_ERR:
-            return parse_fips_enabled(e.stdout)
+            return _parse_fips_enabled(e.output.decode("utf-8"))
         else:
             raise
 
-def set_fips_mode(options):
-    if options.fips:
-        state = 'true'
+
+def _set_fips_mode(enable: bool, db_name: str):
+    if enable:
+        state = "true"
     else:
-        if get_system_fips_enabled():
+        if _get_system_fips_enabled():
             logger.warning("System FIPS enabled, cannot disable FIPS")
             return
-        state = 'false'
+        state = "false"
 
-    logging.info('setting fips: %s', state)
+    logging.info("setting fips: %s", state)
 
-    cmd_args = ['/usr/bin/modutil',
-                '-dbdir', options.db_name,       # NSS database
-                '-fips', state,                  # enable/disable fips
-                '-force'
-                ]
+    cmd_args = [
+        resolve_path("modutil"),
+        "-dbdir",
+        db_name,  # NSS database
+        "-fips",
+        state,  # enable/disable fips
+        "-force",
+    ]
 
     try:
-        stdout, stderr = run_cmd(cmd_args)
-    except CmdError as e:
-        if options.fips and e.returncode == FIPS_ALREADY_ON_ERR:
+        subprocess.check_call(cmd_args)
+    except subprocess.CalledProcessError as e:
+        if enable and e.returncode == FIPS_ALREADY_ON_ERR:
             pass
-        elif not options.fips and e.returncode == FIPS_ALREADY_OFF_ERR:
+        elif not enable and e.returncode == FIPS_ALREADY_OFF_ERR:
             pass
         else:
             raise
-#-------------------------------------------------------------------------------
-
-def setup_certs(args):
-    global logger
-
-    # --- cmd ---
-    parser = argparse.ArgumentParser(description='create certs for testing',
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
-    parser.add_argument('--verbose', action='store_true',
-                        help='provide info level messages')
-
-    parser.add_argument('--debug', action='store_true',
-                        help='provide debug level messages')
-
-    parser.add_argument('--quiet', action='store_true',
-                        help='do not display any messages')
-
-    parser.add_argument('--show-certs', action='store_true',
-                        help='show the certificate details')
-
-    parser.add_argument('--no-clean', action='store_false', dest='clean',
-                        help='do not remove existing db_dir')
-
-    parser.add_argument('--no-trusted-certs', dest='add_trusted_certs', action='store_false',
-                        help='do not add trusted certs')
-
-    parser.add_argument('--hostname',
-                        help='hostname used in cert subjects')
-
-    parser.add_argument('--db-type',
-                        choices=['sql', ''],
-                        help='NSS database type')
-
-    parser.add_argument('--db-dir',
-                        help='NSS database directory')
-
-    parser.add_argument('--db-passwd',
-                        help='NSS database password')
-
-    parser.add_argument('--ca-subject',
-                        help='CA certificate subject')
-
-    parser.add_argument('--ca-nickname',
-                        help='CA certificate nickname')
-
-    parser.add_argument('--server-subject',
-                        help='server certificate subject')
-
-    parser.add_argument('--server-nickname',
-                        help='server certificate nickname')
-
-    parser.add_argument('--client-username',
-                        help='client user name, used in client cert subject')
-
-    parser.add_argument('--client-subject',
-                        help='client certificate subject')
-
-    parser.add_argument('--client-nickname',
-                        help='client certificate nickname')
-
-    parser.add_argument('--serial-number', type=int,
-                        help='starting serial number for certificates')
-
-    parser.add_argument('--valid-months', dest='valid_months', type=int,
-                        help='validity period in months')
-    parser.add_argument('--path-len', dest='ca_path_len', type=int,
-                        help='basic constraints path length')
-    parser.add_argument('--key-type', dest='key_type',
-                        help='key type, either rsa or dsa')
-    parser.add_argument('--key-size', dest='key_size',
-                        help='number of bits in key (must be multiple of 8)')
-    parser.add_argument('--serial-file', dest='serial_file',
-                        help='name of file used to track next serial number')
-
-    parser.add_argument('--db-fips', action='store_true',
-                        help='enable FIPS mode on NSS Database')
-
-    parser.set_defaults(verbose = False,
-                        debug = False,
-                        quiet = False,
-                        show_certs = False,
-                        clean = True,
-                        add_trusted_certs = True,
-                        hostname = os.uname()[1],
-                        db_type = 'sql',
-                        db_dir = 'pki',
-                        db_passwd = 'DB_passwd',
-                        ca_subject = 'CN=Test CA',
-                        ca_nickname = 'test_ca',
-                        server_subject =  'CN=${hostname}',
-                        server_nickname = 'test_server',
-                        client_username = 'test_user',
-                        client_subject = 'CN=${client_username}',
-                        client_nickname = '${client_username}',
-                        serial_number = 1,
-                        key_type = 'rsa',
-                        key_size = 1024,
-                        valid_months = 12,
-                        ca_path_len = 2,
-                        serial_file = '${db_dir}/serial',
-                        fips = False,
-                        )
 
 
-    options = parser.parse_args(args)
+class CertificateDatabase:
+    _DB_PASSWD = "DB_passwd"
+    _DB_DIRECTORY = "pki"
+    _SERVER_NICKNAME = "test_server"
+    _CLIENT_NICKNAME = "test_user"
+    _FIPS = False
 
-    # Do substitutions on option values.
-    # This is ugly because argparse does not expose an API which permits iterating over
-    # the contents of options nor a way to get the options as a dict, ugh :-(
-    # So we access options.__dict__ directly.
-    for key in list(options.__dict__.keys()):
-        # Assume options never begin with underscore
-        if key.startswith('_'):
-            continue
-        value = getattr(options, key)
-        # Can't substitue on non-string values
-        if not isinstance(value, six.string_types):
-            continue
-        # Don't bother trying to substitute if $ substitution character isn't present
-        if '$' not in value:
-            continue
-        setattr(options, key, Template(value).substitute(options.__dict__))
+    _CA_SUBJECT = "CN=Test CA"
+    _CA_NICKNAME = "test_ca"
+    _KEY_SIZE = 2048
+    _VALID_MONTHS = 12
+    _CA_PATH_LEN = 2
+    _CLIENT_SUBJECT = "CN=test_user"
 
-    # Set up logging
-    log_level = logging.INFO
-    if options.quiet:
-        log_level = logging.ERROR
-    if options.verbose:
-        log_level = logging.INFO
-    if options.debug:
-        log_level = logging.DEBUG
+    def __init__(self, basedir: pathlib.Path):
+        self._db_passwd = self._DB_PASSWD
 
-    # Initialize logging
-    logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
-    logger = logging.getLogger()
+        db_directory = basedir / self._DB_DIRECTORY
+        logging.info("Creating clean database directory: %s", db_directory)
+        db_directory.mkdir()
 
-    # Synthesize some useful options derived from specified options
-    if options.db_type == '':
-        options.db_name = options.db_dir
-    else:
-        options.db_name = '%s:%s' % (options.db_type, options.db_dir)
-    options.passwd_filename = None
-    options.noise_filename = None
+        self._db_name = "sql:%s" % db_directory
 
-    # Set function to clean up on exit, bind fuction with options
-    def exit_handler_with_options():
-        exit_handler(options)
-    atexit.register(exit_handler_with_options)
+        self._server_nickname = self._SERVER_NICKNAME
+        self._client_nickname = self._CLIENT_NICKNAME
+        self._ca_nickname = self._CA_NICKNAME
 
-    cert_nicknames = []
+        _create_database(self.db_passwd, self._db_name)
+        _set_fips_mode(self._FIPS, self._db_name)
 
-    try:
-        create_database(options)
-        set_fips_mode(options)
-        cert_nicknames.append(create_ca_cert(options))
-        cert_nicknames.append(create_server_cert(options))
-        cert_nicknames.append(create_client_cert(options))
-        if options.add_trusted_certs:
-            add_trusted_certs(options)
-    except CmdError as e:
-        logging.error(e.message)
-        logging.error(e.stderr)
-        return 1
+        serial_file = db_directory / "serial"
 
-    if options.show_certs:
-        if logger.getEffectiveLevel() > logging.INFO:
-            logger.setLevel(logging.INFO)
-        for nickname in cert_nicknames:
-            logging.info('Certificate nickname "%s"\n%s',
-                         nickname, format_cert(options, nickname))
+        hostname = os.uname()[1]
+        server_subject = "CN=%s" % hostname
 
-    logging.info('---------- Summary ----------')
-    logging.info('NSS database name="%s", password="%s"',
-                 options.db_name, options.db_passwd)
-    logging.info('system FIPS mode=%s', get_system_fips_enabled());
-    logging.info('DB FIPS mode=%s', get_db_fips_enabled(options.db_name));
-    logging.info('CA nickname="%s", CA subject="%s"',
-                 options.ca_nickname, options.ca_subject)
-    logging.info('server nickname="%s", server subject="%s"',
-                 options.server_nickname, options.server_subject)
-    logging.info('client nickname="%s", client subject="%s"',
-                 options.client_nickname, options.client_subject)
+        with _passwd_file(self.db_passwd) as pwf:
+            ca_cert = _create_ca_cert(
+                self.db_name,
+                pwf,
+                serial_file,
+                self._CA_SUBJECT,
+                self.ca_nickname,
+                self._KEY_SIZE,
+                self._VALID_MONTHS,
+                self._CA_PATH_LEN,
+            )
+            server_cert = _create_server_cert(
+                self.db_name,
+                pwf,
+                serial_file,
+                ca_cert,
+                server_subject,
+                self.server_nickname,
+                self._KEY_SIZE,
+                self._VALID_MONTHS,
+            )
+            client_cert = _create_client_cert(
+                self.db_name,
+                pwf,
+                serial_file,
+                ca_cert,
+                self._CLIENT_SUBJECT,
+                self.client_nickname,
+                self._KEY_SIZE,
+                self._VALID_MONTHS,
+            )
 
-    return 0
+        _add_trusted_certs(self.db_name)
 
-#-------------------------------------------------------------------------------
+        logging.info("---------- Summary ----------")
+        logging.info('NSS database name="%s", password="%s"', self.db_name, self.db_passwd)
+        logging.info("system FIPS mode=%s", _get_system_fips_enabled())
+        logging.info("DB FIPS mode=%s", _get_db_fips_enabled(self.db_name))
+        logging.info('CA nickname="%s", CA subject="%s"', ca_cert, self._CA_SUBJECT)
+        logging.info('server nickname="%s", server subject="%s"', server_cert, server_subject)
+        logging.info('client nickname="%s", client subject="%s"', client_cert, self._CLIENT_SUBJECT)
 
-def main():
-    return setup_certs(None)
+    @property
+    def db_passwd(self):
+        return self._db_passwd
 
-if __name__ == '__main__':
-    sys.exit(main())
+    @property
+    def db_name(self):
+        return self._db_name
+
+    @property
+    def server_nickname(self):
+        return self._server_nickname
+
+    @property
+    def client_nickname(self):
+        return self._client_nickname
+
+    @property
+    def ca_nickname(self):
+        return self._ca_nickname
+
+
+@pytest.fixture(scope="class")
+def setup_certs(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("certdb")
+    return CertificateDatabase(tmp_path)
