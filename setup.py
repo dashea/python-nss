@@ -42,7 +42,7 @@ nss_ssl_extension = Extension(
 
 setup(
     name="python-nss",
-    package_dir={"nss": "src"},
+    package_dir={"nss": "nss"},
     packages=["nss"],
     ext_modules=[nss_error_extension, nss_io_extension, nss_nss_extension, nss_ssl_extension],
 )
