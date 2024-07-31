@@ -183,11 +183,7 @@ set_nspr_error(const char *format, ...)
     PyObject *exception_obj = NULL;
 
     if (format) {
-#ifdef HAVE_STDARG_PROTOTYPES
         va_start(vargs, format);
-#else
-        va_start(vargs);
-#endif
         error_message = PyUnicode_FromFormatV(format, vargs);
         va_end(vargs);
     }
@@ -219,11 +215,7 @@ set_cert_verify_error(unsigned long usages, PyObject *log, const char *format, .
     PyObject *exception_obj = NULL;
 
     if (format) {
-#ifdef HAVE_STDARG_PROTOTYPES
         va_start(vargs, format);
-#else
-        va_start(vargs);
-#endif
         error_message = PyUnicode_FromFormatV(format, vargs);
         va_end(vargs);
     }
